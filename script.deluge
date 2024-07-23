@@ -1,0 +1,214 @@
+SDPConfig = g_GetConfig();
+LocalAdminPasswordField = "udf_sline_2401"; //SDP API field name for local admin password
+assetsURL = SDPConfig.get("url")+"/api/v3/assets";
+
+//Get list of local admin passwords from PS
+PSRecords = g_GetPSLocalAdminRecords().get("records");
+
+//Map hostnames to PW IDs and passwords from the PS API response
+passwords = Map();
+for each record in PSRecords
+{
+	title = record.get("Title");
+	id = record.get("PasswordID");
+	
+	backslash_pos = title.find('\\');
+	if(backslash_pos != -1)
+	{
+		title = title.left(backslash_pos);
+	}
+	passwords.put(title.toUpperCase(),{"id":id});
+}
+
+//Get asset information
+assets = Collection();
+assetMap = g_GetAllAssets();
+for each a in assetMap.get("assets")
+{
+	assets.add(a);
+}
+
+//Get each asset individually now that we have a list of ids
+//This gets more information than when batch GETing assets, most importantly the last scan time
+lastScanDates = Map();
+for each asset in assets
+{
+	assetReq = invokeurl
+	[
+		url: assetsURL+"/"+asset.toMap().get("id")
+		type: GET
+		parameters: {"TECHNICIAN_KEY":SDPConfig.get("key")}
+	];
+	name = assetReq.get("asset").get("name");
+	last_success_audit = assetReq.get("asset").get("last_success_audit");
+	if(last_success_audit != null)
+	{
+		lastScanDates.put(name.toUpperCase(),last_success_audit.get("time").get("display_value"));
+	}
+}
+
+//Format asset list
+suspectHostnames = Collection();
+for each asset in assets
+{
+	name = asset.toMap().get("name");
+	domain_pos = name.find(".corp_domain.com");
+	if(domain_pos != -1)
+	{
+		name = name.left(domain_pos);
+	}
+	name = name.toUpperCase();
+
+	//Check for matching key and insert password
+	if(passwords.containKey(name))
+	{
+		PSRecord = passwords.get(name);
+		permalink = "https://corp_ps_url/pid="+PSRecord.get("id"); //This will need changed if PS changes their permalink naming scheme
+		input_data = {"asset":{"udf_fields":{LocalAdminPasswordField:permalink}}};
+	}
+	else 
+    {
+		//Get individual asset info so we can get the last_success_audit field
+		assetReq = invokeurl
+		[
+			url: assetsURL+"/"+asset.toMap().get("id")
+			type: GET
+			parameters: {"TECHNICIAN_KEY":SDPConfig.get("key")}
+		];
+		name = assetReq.get("asset").get("name");
+		last_success_audit = assetReq.get("asset").get("last_success_audit");
+		
+		if(last_success_audit != null)
+		{
+			last_success_audit = last_success_audit.get("time").get("display_value");
+			if(last_success_audit.daysBetween(now) < 30)
+			{
+				suspectHostnames.insert(name);
+			}
+		}
+		else 
+        {
+			last_success_audit = "Never";
+        }
+		input_data = {"asset":{"udf_fields":{LocalAdminPasswordField: "N/A. Last good SDP scan: "+last_success_audit}}};
+	}
+	
+	//Fill in the Local Admin Password field
+	req = invokeurl
+	[
+		url: assetsURL+"/"+asset.toMap().get("id")
+		type: PUT
+		parameters: {"input_data":input_data,"TECHNICIAN_KEY":SDPConfig.get("key")}
+	];
+}
+
+if(now.toText('E') == "Mon")//Only run once a week
+{
+	ticketExists = false;
+	id = 0;
+	
+	//Create request to resolve issues with suspectHostnames
+	subject = "Assets with no PasswordState record";
+	
+	//Get request information
+	requestMap = g_GetAllRequests();
+	for each request in requestMap.get("requests")
+	{
+		status = request.get("status").get("name");
+		if(request.get("subject") == subject && (!name.contains("Closed") && !name.contains("Resolved")))
+		{
+			ticketExists = true;
+			id = request.get("id");
+			break;
+		}
+	}
+	
+	//Make new ticket if needed
+	if(!ticketExists)
+	{
+		description = "Assets in the following tasks have been scanned by SDP within the past 30 days, but do not have local admin password record in PasswordState.";
+		requester = {"name":"0xBD"};
+		input_data = {"request":{"subject":subject,"description":description,"requester":requester}};
+		req = invokeurl
+		[
+			url: SDPConfig.get("url")+"/api/v3/requests/"
+			type: POST
+			parameters: {"input_data":input_data,"TECHNICIAN_KEY":SDPConfig.get("key")}
+		];
+
+		info "##### NEW REQUEST #####";
+		info req;
+
+		id = req.get("request").get("id");
+	}
+	
+	info "REQUEST ID: "+id;
+	
+	//Get existing tasks
+	currentTasks = g_GetAllRequestTasks(id);
+	
+	for each asset in suspectHostnames
+	{
+		title = asset.left(asset.find(".corp_domain.com"));
+		description = "Resolve absent PS record";
+		type = {"name":"Maintenance"};// Required to close a task, so best to include it now
+		if(title.length() >= 3)
+		{
+			titleL3 = title.left(3).toUpperCase();
+
+			//Check to see if the tasks exists and was completed
+			taskExists = false;
+			matchingTask = Map();
+			for each task in currentTasks.get("tasks")
+			{
+				//If task has been completed, make note to reopen
+				if(task.get("title") == title)
+				{
+					taskExists = true;
+					matchingTask = task;
+					break;
+				}
+			}
+
+			//Filter out everything but workstations
+			//NOTE: This will require maintaining in the event workstation naming schemes change
+			if(!taskExists && (titleL3 == "prefix1" || titleL3 == "prefix2" || titleL3 == "prefix3"))//If the task doesn't exist, make it
+			{
+				info "##### TASK INSERTION #####";
+				req = invokeurl
+				[
+					url: SDPConfig.get("url")+"/api/v3/requests/"+id+"/tasks"
+					type: POST
+					headers: {"TECHNICIAN_KEY":SDPConfig.get("key")}
+					parameters: {"input_data":{"task":{"description":description,"title":title,"type":type}}}
+				];
+				info req;
+			}
+			else if(taskExists && matchingTask.get("percentage_completion") == 100)//If it does exist and was completed, update it to "-New" (id:2)
+			{
+				info "##### TASK UPDATE #####";
+				req = invokeurl
+				[
+					url: SDPConfig.get("url")+"/api/v3/requests/"+id+"/tasks/"+matchingTask.get("id")
+					type: PUT
+					headers: {"TECHNICIAN_KEY":SDPConfig.get("key")}
+					parameters: {"input_data":{"task":{"status":{"id":2}}}}
+				];
+				info req;
+			}
+			else if(!taskExists && matchingTask.get("percentage_completion") == 100)//If the task was completed and isn't showing up on the current scan, remove the task
+			{
+				info "##### TASK DELETE #####";
+				req = invokeurl
+				[
+					url: SDPConfig.get("url")+"/api/v3/requests/"+id+"/tasks/"+matchingTask.get("id")
+					type: DELETE
+					headers: {"TECHNICIAN_KEY":SDPConfig.get("key")}
+				];
+				info req;
+			}
+		}
+	}
+}
+
+return reportObj;
